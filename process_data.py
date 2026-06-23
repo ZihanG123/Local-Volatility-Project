@@ -327,13 +327,40 @@ def run_prob5a(K: list[float], C_h: list[float], C_l: list[float],
     b = np.concatenate((b, ub, -lb), axis=0)
     b = b.T[0]
 
-    # feasibility (linprog with c=0)
-    c = np.zeros((1, N))
-    res = linprog(list(c), list(A), b, method="highs")
-    if not res.success:
-        raise RuntimeError(f"prob5a linprog failed: {res.message}")
+    # ── Chebyshev-center warm start ───────────────────────────────────────
+    # Instead of starting analytic-center optimization from a polytope vertex
+    # (where the log-barrier objective is -inf), we first find the center of
+    # the largest inscribed ball in {x : Ax <= b}. This is the Chebyshev
+    # center, a single LP:
+    #     max  r
+    #     s.t. A_i x + ||A_i||_2 * r <= b_i  for all i
+    #          r >= 0
+    # The resulting x has guaranteed positive slack to every constraint,
+    # which makes a much better starting point for the analytic-center
+    # log-barrier optimization than a vertex from a c=0 feasibility LP.
+    row_norms = np.linalg.norm(A, axis=1)
+    A_chev = np.hstack([A, row_norms.reshape(-1, 1)])   # N+1 columns
+    c_chev = np.zeros(N + 1); c_chev[-1] = -1.0          # max r = -min(-r)
+    bounds_chev = [(None, None)] * N + [(0.0, None)]     # r >= 0
+    res_chev = linprog(c_chev, A_ub=A_chev, b_ub=b,
+                       bounds=bounds_chev, method="highs")
+    if not res_chev.success:
+        # fallback: ordinary feasibility (vertex) LP
+        c = np.zeros(N)
+        res = linprog(c, A, b, method="highs")
+        if not res.success:
+            raise RuntimeError(f"prob5a linprog failed: {res.message}")
+        x0 = np.asarray(res.x)
+    else:
+        x0 = np.asarray(res_chev.x[:N])
+        r_star = float(res_chev.x[N])
+        if r_star <= 0:
+            # polytope degenerate -- fall back to vertex
+            c = np.zeros(N)
+            res = linprog(c, A, b, method="highs")
+            x0 = np.asarray(res.x)
 
-    # analytic-center smoothing
+    # analytic-center smoothing (from the Chebyshev-center warm start)
     def objective(x):
         slack = b - A @ x
         # use sum of log slacks rather than product (numerically stable)
@@ -341,15 +368,14 @@ def run_prob5a(K: list[float], C_h: list[float], C_l: list[float],
         slack = np.clip(slack, 1e-12, None)
         return -float(np.sum(np.log(slack)))
 
-    x0 = res.x
     result = minimize(
         objective, x0, method="trust-constr",
         constraints=LinearConstraint(A, lb=-np.inf, ub=b),
         options={"maxiter": 500, "gtol": 1e-8},
     )
     if not result.success:
-        # fall back to LP solution if smoothing fails -- still arb-free
-        return np.asarray(x0, dtype=float), Kbar_eff
+        # fall back to the Chebyshev center if smoothing fails -- still arb-free
+        return x0, Kbar_eff
     return np.asarray(result.x, dtype=float), Kbar_eff
 
 
