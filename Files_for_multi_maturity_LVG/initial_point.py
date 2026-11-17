@@ -1,9 +1,8 @@
 import cvxpy as cp
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.sparse import lil_matrix
 
-def construct_constraint_matrix(S0, K_array, bid_ask_compiled, Kbar):
+def construct_constraint_matrix(S0, K_array, bid_ask_compiled):
     M = K_array.shape[0]
     N = K_array.shape[1]
     L = 0.0
@@ -26,6 +25,13 @@ def construct_constraint_matrix(S0, K_array, bid_ask_compiled, Kbar):
             }
             smooth_rows.append((coeffs, 0.0))
 
+        # The call price must still be non-increasing over the final finite
+        # strike interval. This replaces the former Kbar endpoint condition.
+        smooth_rows.append(({
+            offset + N - 2: -1.0,
+            offset + N - 1: 1.0,
+        }, 0.0))
+
         smooth_rows.append(({offset: -1.0}, K[0] - S0))
 
         coeffs = {
@@ -33,12 +39,6 @@ def construct_constraint_matrix(S0, K_array, bid_ask_compiled, Kbar):
             offset + 1: -1.0 / dK[0],
         }
         smooth_rows.append((coeffs, (S0 - L) / (K[0] - L)))
-
-        coeffs = {
-            offset + N - 2: -1.0 / dK[-1],
-            offset + N - 1: 1.0 / (Kbar - K[-1]) + 1.0 / dK[-1],
-        }
-        smooth_rows.append((coeffs, 0.0))
 
         smooth_rows.append(({offset: 1.0}, S0 - L))
 
@@ -57,11 +57,10 @@ def construct_constraint_matrix(S0, K_array, bid_ask_compiled, Kbar):
             Kdiff = K_next[n] - K[n]
             if K[n] < K_next[n]:
                 if n == N - 1:
-                    coeffs = {
-                        m * N + n: 1.0 - Kdiff / (Kbar - K[n]),
-                        (m + 1) * N + n: -1.0,
-                    }
-                    b = 0.0
+                    # There is no right-hand endpoint beyond the finite
+                    # strike grid, so interpolation at this endpoint is not
+                    # constrained by an artificial Kbar value.
+                    continue
                 else:
                     coeffs = {
                         m * N + n: 1.0 - Kdiff / dK[n],
@@ -110,11 +109,74 @@ def construct_constraint_matrix(S0, K_array, bid_ask_compiled, Kbar):
     return A_ub, b_ub
 
 
-def find_initial_point(S0, K_array, bid_ask_compiled, Kbar, return_diagnostics=False):
+def construct_single_constraint_matrix(S0, K, bid_ask):
+    K = np.asarray(K, dtype=float)
+    bid_ask = np.asarray(bid_ask, dtype=float)
+
+    if K.ndim != 1 or K.size < 2:
+        raise ValueError("K must be a one-dimensional array with at least two strikes")
+    if np.any(np.diff(K) <= 0.0):
+        raise ValueError("K must contain strictly increasing strikes")
+    if bid_ask.ndim != 2 or bid_ask.shape[1] < 3:
+        raise ValueError("bid_ask must be a two-dimensional array with at least three columns")
+
+    N = K.size
+    L = 0.0
+    market_rows = []
+    smooth_rows = []
+    dK = np.diff(K)
+
+    for i in range(N - 2):
+        coeffs = {
+            i: -1.0 / dK[i],
+            i + 1: 1.0 / dK[i] + 1.0 / dK[i + 1],
+            i + 2: -1.0 / dK[i + 1],
+        }
+        smooth_rows.append((coeffs, 0.0))
+
+    # Enforce a non-positive slope over the final finite strike interval.
+    smooth_rows.append(({N - 2: -1.0, N - 1: 1.0}, 0.0))
+
+    smooth_rows.append(({0: -1.0}, K[0] - S0))
+
+    coeffs = {
+        0: 1.0 / (K[0] - L) + 1.0 / dK[0],
+        1: -1.0 / dK[0],
+    }
+    smooth_rows.append((coeffs, (S0 - L) / (K[0] - L)))
+
+    smooth_rows.append(({0: 1.0}, S0 - L))
+
+    indices = np.searchsorted(K, bid_ask[:, 0])
+    if np.any(indices >= N):
+        raise ValueError("bid_ask contains a strike above the supplied strike grid")
+    for idx, upper, lower in zip(indices, bid_ask[:, 2], bid_ask[:, 1]):
+        market_rows.append(({int(idx): 1.0}, upper))
+        market_rows.append(({int(idx): -1.0}, -lower))
+
+    ordered_rows = market_rows + smooth_rows
+    A_ub = lil_matrix((len(ordered_rows), N))
+    b_ub = np.empty(len(ordered_rows), dtype=float)
+
+    for row_idx, (coeffs, b) in enumerate(ordered_rows):
+        for col_idx, coeff in coeffs.items():
+            A_ub[row_idx, col_idx] = coeff
+        b_ub[row_idx] = b
+
+    row_norms = np.sqrt(np.asarray(A_ub.multiply(A_ub).sum(axis=1)).ravel())
+    if np.any(row_norms <= 0.0):
+        raise ValueError("Constraint matrix contains a zero-norm row")
+    A_ub = A_ub.multiply(1.0 / row_norms[:, None]).tocsr()
+    b_ub = b_ub / row_norms
+
+    return A_ub, b_ub
+
+
+def find_initial_point(S0, K_array, bid_ask_compiled, return_diagnostics=False):
     M = K_array.shape[0]
     N = K_array.shape[1]
     total_vars = M * N
-    A_ub, b_ub = construct_constraint_matrix(S0, K_array, bid_ask_compiled, Kbar)
+    A_ub, b_ub = construct_constraint_matrix(S0, K_array, bid_ask_compiled)
     prices = cp.Variable(total_vars, nonneg=True)
     radius = cp.Variable(nonneg=True)
     
@@ -137,11 +199,43 @@ def find_initial_point(S0, K_array, bid_ask_compiled, Kbar, return_diagnostics=F
         return initial_point, radius.value, max_violation
     return initial_point
 
-def find_bad_constraints(S0, K_array, bid_ask_compiled, Kbar, epsilon):
+
+def find_single_initial_point(
+    S0,
+    K,
+    bid_ask,
+    return_diagnostics=False,
+):
+    K = np.asarray(K, dtype=float)
+    A_ub, b_ub = construct_single_constraint_matrix(S0, K, bid_ask)
+    prices = cp.Variable(len(K), nonneg=True)
+    radius = cp.Variable(nonneg=True)
+
+    problem = cp.Problem(
+        cp.Maximize(radius),
+        [cp.Constant(A_ub) @ prices + radius <= b_ub],
+    )
+    problem.solve(solver=cp.CLARABEL, tol_feas=1e-10, tol_gap_abs=1e-10)
+    if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+        raise ValueError(f"Chebyshev-center solve failed: {problem.status}")
+
+    initial_point = np.asarray(prices.value).reshape(-1)
+    slack = b_ub - A_ub @ initial_point
+    max_violation = max(0.0, -float(np.min(slack)))
+
+    if max_violation > 0:
+        raise ValueError("INFEASIBLE")
+
+    if return_diagnostics:
+        return initial_point, radius.value, max_violation
+    return initial_point
+
+
+def find_bad_constraints(S0, K_array, bid_ask_compiled, epsilon):
     M = K_array.shape[0]
     N = K_array.shape[1]
     total_vars = M * N
-    A_ub, b_ub = construct_constraint_matrix(S0, K_array, bid_ask_compiled, Kbar)
+    A_ub, b_ub = construct_constraint_matrix(S0, K_array, bid_ask_compiled)
     total_bid_ask_constraints = sum(arr.shape[0] * 2 for arr in bid_ask_compiled)
     prices = cp.Variable(total_vars, nonneg=True)
     slack = cp.Variable(total_bid_ask_constraints, nonneg=True)
@@ -175,7 +269,6 @@ def find_bad_constraints(S0, K_array, bid_ask_compiled, Kbar, epsilon):
             S0,
             K_array,
             bid_ask_compiled,
-            Kbar,
             next_epsilon,
         )
 

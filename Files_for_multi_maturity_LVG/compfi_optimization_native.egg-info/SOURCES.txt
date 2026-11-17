@@ -1,0 +1,7 @@
+optimization_cpp.cpp
+pyproject.toml
+setup.py
+compfi_optimization_native.egg-info/PKG-INFO
+compfi_optimization_native.egg-info/SOURCES.txt
+compfi_optimization_native.egg-info/dependency_links.txt
+compfi_optimization_native.egg-info/top_level.txt

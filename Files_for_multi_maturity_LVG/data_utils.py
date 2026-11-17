@@ -6,7 +6,7 @@ import cvxpy as cp
 from IPython.display import display
 
 
-_SPX_CACHE_PATH = Path(__file__).with_name("spx_prices.csv")
+_SPX_CACHE_PATH = Path(__file__).resolve().parent / "datasets" / "spx_prices.csv"
 _spx_cache_df = pd.read_csv(_SPX_CACHE_PATH, index_col=0, parse_dates=True)
 _spx_cache = {
     int(pd.to_datetime(date).strftime("%Y%m%d")): float(value)

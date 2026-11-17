@@ -24,6 +24,14 @@ struct Curve {
 using Point = std::array<double, 2>;
 using LowerBound = std::vector<Point>;
 
+std::array<double, 2> coefficients_from_value_slope(
+    double value, double slope, double sigma) {
+    return {
+        0.5 * (value - sigma * slope),
+        0.5 * (value + sigma * slope),
+    };
+}
+
 Vector read_vector(py::handle object, const std::string& name) {
     using Array = py::array_t<double, py::array::c_style | py::array::forcecast>;
     Array array = Array::ensure(object);
@@ -62,16 +70,22 @@ Coefficients make_coefficients1(double S0, const Vector& sigs, const Vector& nus
     Coefficients result;
     result.reserve(count);
     const double dist0 = nus[1] - nus[0];
-    result.push_back({-std::exp(-dist0 / sigs[0]), std::exp(dist0 / sigs[0])});
+    const double x = dist0 / sigs[0];
+    const double cosh_x = std::cosh(x);
+    const double sinh_x = std::sinh(x);
+    result.push_back({sinh_x - cosh_x, cosh_x + sinh_x});
 
     for (size_t i = 0; i + 1 < count; ++i) {
         const double a = result.back()[0] + result.back()[1];
         const double b = (-result.back()[0] + result.back()[1]) / sigs[i];
         const double dist = nus[i + 2] - nus[i + 1];
-        result.push_back({
-            0.5 * (a - sigs[i + 1] * b) * std::exp(-dist / sigs[i + 1]),
-            0.5 * (a + sigs[i + 1] * b) * std::exp(dist / sigs[i + 1]),
-        });
+        const double sigma = sigs[i + 1];
+        const double x = dist / sigma;
+        const double cosh_x = std::cosh(x);
+        const double sinh_x = std::sinh(x);
+        const double value = a * cosh_x + sigma * b * sinh_x;
+        const double slope = (a / sigma) * sinh_x + b * cosh_x;
+        result.push_back(coefficients_from_value_slope(value, slope, sigma));
     }
     return result;
 }
@@ -80,34 +94,33 @@ Coefficients make_coefficients2(double S0, const Vector& sigs, const Vector& nus
                                 size_t split) {
     (void)S0;
     const size_t count = sigs.size() - split;
-    if (count == 0 || split == 0 || split + count >= nus.size()) {
+    if (count == 0 || split == 0 || split + count > nus.size()) {
         throw py::value_error("curve knots must straddle S0 with intervals on both sides");
     }
     Coefficients result(count);
-    const double dist_end = nus.back() - nus[nus.size() - 2];
-    result[count - 1] = {
-        std::exp(dist_end / sigs.back()),
-        -std::exp(-dist_end / sigs.back()),
-    };
+    // Infinite right tail: match calibration.load_c_values, where the
+    // terminal right-tail coefficients are normalized to [1, 0].
+    result[count - 1] = {1.0, 0.0};
 
     for (size_t i = count - 1; i > 0; --i) {
         const double a = result[i][0] + result[i][1];
         const double b = (-result[i][0] + result[i][1]) / sigs[split + i];
         const double dist = nus[split + i] - nus[split + i - 1];
-        result[i - 1] = {
-            0.5 * (a - sigs[split + i - 1] * b) *
-                std::exp(dist / sigs[split + i - 1]),
-            0.5 * (a + sigs[split + i - 1] * b) *
-                std::exp(-dist / sigs[split + i - 1]),
-        };
+        const double sigma = sigs[split + i - 1];
+        const double x = dist / sigma;
+        const double cosh_x = std::cosh(x);
+        const double sinh_x = std::sinh(x);
+        const double value = a * cosh_x - sigma * b * sinh_x;
+        const double slope = -(a / sigma) * sinh_x + b * cosh_x;
+        result[i - 1] = coefficients_from_value_slope(value, slope, sigma);
     }
     return result;
 }
 
 Curve make_curve(double S0, Vector sigs, Vector nus) {
-    if (nus.size() != sigs.size() + 1 || sigs.size() < 2 ||
+    if (nus.size() != sigs.size() || sigs.size() < 2 ||
         !std::is_sorted(nus.begin(), nus.end())) {
-        throw py::value_error("each curve requires increasing nus and len(nus) == len(sigs) + 1");
+        throw py::value_error("each curve requires increasing nus and len(nus) == len(sigs)");
     }
     const size_t split = static_cast<size_t>(
         std::lower_bound(nus.begin(), nus.end(), S0) - nus.begin());
@@ -137,48 +150,57 @@ Curve make_curve(double S0, Vector sigs, Vector nus) {
 
 Vector evaluate(const Curve& curve, double S0, const Vector& strikes,
                 bool call_value, bool derivative = false) {
+    // Callers provide strikes in increasing order and within the curve domain.
+    // Split once at S0 instead of branching or masking every strike.
     const size_t split = static_cast<size_t>(
         std::lower_bound(curve.nus.begin(), curve.nus.end(), S0) - curve.nus.begin());
     Vector values(strikes.size(), 0.0);
-    for (size_t i = 0; i < strikes.size(); ++i) {
+    const size_t strike_split = static_cast<size_t>(
+        std::lower_bound(strikes.begin(), strikes.end(), S0) - strikes.begin());
+    for (size_t i = 0; i < strike_split; ++i) {
         const double strike = strikes[i];
-        if (strike < curve.nus.front() || strike > curve.nus.back()) {
-            continue;
-        }
-        if (strike < S0) {
-            const auto end = curve.nus.begin() + static_cast<ptrdiff_t>(split + 1);
-            size_t index = static_cast<size_t>(
-                std::lower_bound(curve.nus.begin(), end, strike) - curve.nus.begin());
-            index = std::clamp(index, size_t{1}, curve.c1.size());
-            const size_t coeff_index = index - 1;
-            const double dist = curve.nus[index] - strike;
-            const double sigma = curve.sigs[coeff_index];
-            const auto& coeff = curve.c1[coeff_index];
-            if (derivative) {
-                values[i] = (-coeff[0] * std::exp(dist / sigma) +
-                             coeff[1] * std::exp(-dist / sigma)) / sigma;
-                if (call_value) values[i] -= 1.0;
-            } else {
-                values[i] = coeff[0] * std::exp(dist / sigma) +
-                            coeff[1] * std::exp(-dist / sigma);
-                if (call_value) values[i] += S0 - strike;
-            }
+        const auto end = curve.nus.begin() + static_cast<ptrdiff_t>(split + 1);
+        size_t index = static_cast<size_t>(
+            std::lower_bound(curve.nus.begin(), end, strike) - curve.nus.begin());
+        index = std::clamp(index, size_t{1}, curve.c1.size());
+        const size_t coeff_index = index - 1;
+        const double dist = curve.nus[index] - strike;
+        const double sigma = curve.sigs[coeff_index];
+        const auto& coeff = curve.c1[coeff_index];
+        const double x = dist / sigma;
+        const double cosh_x = std::cosh(x);
+        const double sinh_x = std::sinh(x);
+        const double coeff_sum = coeff[0] + coeff[1];
+        const double coeff_difference = coeff[0] - coeff[1];
+        if (derivative) {
+            values[i] = (-coeff_difference * cosh_x -
+                         coeff_sum * sinh_x) / sigma;
+            if (call_value) values[i] -= 1.0;
         } else {
-            const auto begin = curve.nus.begin() + static_cast<ptrdiff_t>(split);
-            size_t index = static_cast<size_t>(
-                std::upper_bound(begin, curve.nus.end(), strike) - begin);
-            index = std::clamp(index, size_t{1}, curve.c2.size());
-            const size_t coeff_index = index - 1;
-            const double dist = strike - curve.nus[split + coeff_index];
-            const double sigma = curve.sigs[split + coeff_index];
-            const auto& coeff = curve.c2[coeff_index];
-            if (derivative) {
-                values[i] = (-coeff[0] * std::exp(-dist / sigma) +
-                             coeff[1] * std::exp(dist / sigma)) / sigma;
-            } else {
-                values[i] = coeff[0] * std::exp(-dist / sigma) +
-                            coeff[1] * std::exp(dist / sigma);
-            }
+            values[i] = coeff_sum * cosh_x + coeff_difference * sinh_x;
+            if (call_value) values[i] += S0 - strike;
+        }
+    }
+    for (size_t i = strike_split; i < strikes.size(); ++i) {
+        const double strike = strikes[i];
+        const auto begin = curve.nus.begin() + static_cast<ptrdiff_t>(split);
+        size_t index = static_cast<size_t>(
+            std::upper_bound(begin, curve.nus.end(), strike) - begin);
+        index = std::clamp(index, size_t{1}, curve.c2.size());
+        const size_t coeff_index = index - 1;
+        const double dist = strike - curve.nus[split + coeff_index];
+        const double sigma = curve.sigs[split + coeff_index];
+        const auto& coeff = curve.c2[coeff_index];
+        const double x = dist / sigma;
+        const double cosh_x = std::cosh(x);
+        const double sinh_x = std::sinh(x);
+        const double coeff_sum = coeff[0] + coeff[1];
+        const double coeff_difference = coeff[1] - coeff[0];
+        if (derivative) {
+            values[i] = (coeff_difference * cosh_x +
+                         coeff_sum * sinh_x) / sigma;
+        } else {
+            values[i] = coeff_sum * cosh_x + coeff_difference * sinh_x;
         }
     }
     return values;
@@ -234,8 +256,25 @@ bool monotonicity_valid(const std::vector<Curve>& curves,
                         const Curve& candidate, double S0, size_t index,
                         int num_strikes, LowerBound& candidate_lower_bound) {
     if (curves.size() <= 1) return true;
+    double kbar = curves.front().nus.back();
+    for (const auto& curve : curves) {
+        kbar = std::max(kbar, curve.nus.back());
+    }
+    const Vector kbar_strike{ kbar };
+    const double candidate_kbar_value = evaluate(
+        candidate, S0, kbar_strike, true
+    ).front();
+
     candidate_lower_bound = generate_lower_bound(candidate, S0, num_strikes);
     if (index > 0) {
+        const Curve& previous = curves[index - 1];
+        const double previous_kbar_value = evaluate(
+            previous, S0, kbar_strike, true
+        ).front();
+        if (previous_kbar_value > candidate_kbar_value ||
+            previous.sigs.back() > candidate.sigs.back()) {
+            return false;
+        }
         Vector strikes;
         Vector bound_values;
         for (const auto& point : candidate_lower_bound) {
@@ -248,6 +287,14 @@ bool monotonicity_valid(const std::vector<Curve>& curves,
         }
     }
     if (index + 1 < curves.size()) {
+        const Curve& next = curves[index + 1];
+        const double next_kbar_value = evaluate(
+            next, S0, kbar_strike, true
+        ).front();
+        if (candidate_kbar_value > next_kbar_value ||
+            candidate.sigs.back() > next.sigs.back()) {
+            return false;
+        }
         Vector strikes;
         Vector bound_values;
         for (const auto& point : lower_bounds[index + 1]) {
